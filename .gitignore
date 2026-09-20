@@ -4,3 +4,4 @@ AREAL_LOAN.pdf
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.env
