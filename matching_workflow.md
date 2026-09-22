@@ -102,7 +102,7 @@ python page_matcher.py document.json --stdout
 | `--stdout` | Print JSON to stdout instead of writing a file (overrides `--out`) |
 | `--base-url` | LM Studio OpenAI-compatible base URL, default `http://127.0.0.1:1234/v1` |
 | `--model` | LM Studio model id; auto-resolved from `GET /models` when omitted |
-| `--categories-json` | Categories JSON from `page_classifier.py`; default is the OCR path with `.categories.json` when present |
+| `--categories-json` | Categories JSON from `page_classifier.py` or the verified `.category_review.json` from `category_verifier.py` (same shape; the `verification` block is ignored); default is the OCR path with `.categories.json` when present |
 | `--vlm-json` | VLM JSON from `vlm_extract.py`; default is the OCR path with `.vlm.json` when present |
 | `--weight-embedding` | Embedding weight, default `0.60` |
 | `--weight-category` | Category weight, default `0.25` |

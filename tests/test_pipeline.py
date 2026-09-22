@@ -91,6 +91,14 @@ def make_categories_payload(pages: list[dict], total_seconds: float = 2.0) -> di
     }
 
 
+def make_verifications_payload(pages: list[dict], total_seconds: float = 0.3) -> dict:
+    return {
+        "categories": dict(CATEGORY_LABELS),
+        "pages": pages,
+        "timings": {"total_seconds": total_seconds},
+    }
+
+
 def make_vlm_page(
     number: int,
     extracted: dict,
@@ -408,15 +416,38 @@ def test_build_timings_sums_pages_and_stages() -> None:
         ],
         total_seconds=3.0,
     )
+    verifications = make_verifications_payload(
+        [
+            make_category_page(1, "lender_rate_note", total_seconds=0.4),
+            make_category_page(
+                2,
+                None,
+                confidence=None,
+                needs_review=True,
+                review_reason="empty text",
+                total_seconds=0.0,
+            ),
+        ],
+        total_seconds=0.6,
+    )
     matches = make_matches_payload([[1]], unique_pages=(2,), total_seconds=0.9)
     category_index = {1: categories["pages"][0], 2: categories["pages"][1]}
     vlm_index = {1: vlm["pages"][0], 2: vlm["pages"][1]}
     timings = build_timings(
-        ocr, categories, vlm, matches, ocr["pages"], category_index, vlm_index, 7.5
+        ocr,
+        categories,
+        verifications,
+        vlm,
+        matches,
+        ocr["pages"],
+        category_index,
+        vlm_index,
+        7.5,
     )
     assert timings["stages_seconds"] == {
         "ocr": 2.0,
         "classification": 1.1,
+        "verification": 0.6,
         "vlm": 3.0,
         "matching": 0.9,
     }
@@ -434,12 +465,29 @@ def test_build_timings_sums_pages_and_stages() -> None:
 def test_build_result_rejects_missing_category_pages() -> None:
     ocr = make_ocr_payload({1: "text", 2: "text"})
     categories = make_categories_payload([make_category_page(1, "title_rider")])
+    verifications = make_verifications_payload(
+        [make_category_page(1, "title_rider"), make_category_page(2, "title_rider")]
+    )
     vlm = make_vlm_payload(
         [make_vlm_page(1, fields()), make_vlm_page(2, fields())]
     )
     matches = make_matches_payload([[1, 2]])
     with pytest.raises(ValueError, match="do not match the OCR pages"):
-        build_result(ocr, categories, vlm, matches, 1.0)
+        build_result(ocr, categories, verifications, vlm, matches, 1.0)
+
+
+def test_build_result_rejects_missing_verification_pages() -> None:
+    ocr = make_ocr_payload({1: "text", 2: "text"})
+    categories = make_categories_payload(
+        [make_category_page(1, "title_rider"), make_category_page(2, "title_rider")]
+    )
+    verifications = make_verifications_payload([make_category_page(1, "title_rider")])
+    vlm = make_vlm_payload(
+        [make_vlm_page(1, fields()), make_vlm_page(2, fields())]
+    )
+    matches = make_matches_payload([[1, 2]])
+    with pytest.raises(ValueError, match="Verification JSON pages do not match"):
+        build_result(ocr, categories, verifications, vlm, matches, 1.0)
 
 
 def make_fake_runner(fixtures: dict[str, dict], calls: list[str]):
@@ -452,6 +500,14 @@ def make_fake_runner(fixtures: dict[str, dict], calls: list[str]):
             write_json(
                 Path(command[2]).with_suffix(".categories.json"), fixtures["categories"]
             )
+        elif script == "category_verifier.py":
+            categories_path = Path(command[2])
+            review_path = categories_path.with_name(
+                categories_path.name.replace(
+                    pipeline.CATEGORIES_SUFFIX, pipeline.REVIEW_SUFFIX
+                )
+            )
+            write_json(review_path, fixtures["verifications"])
         elif script == "vlm_extract.py":
             write_json(Path(command[2]).with_suffix(".vlm.json"), fixtures["vlm"])
         elif script == "page_matcher.py":
@@ -484,6 +540,28 @@ def test_run_pipeline_end_to_end_with_fake_runner(tmp_path: Path) -> None:
                 make_category_page(4, "title_rider", confidence=0.9),
             ]
         ),
+        "verifications": make_verifications_payload(
+            [
+                make_category_page(
+                    1,
+                    "property_tax_record_information_sheet",
+                    confidence=1.0,
+                    needs_review=True,
+                    review_reason="verifier disagreement",
+                ),
+                make_category_page(
+                    2,
+                    None,
+                    confidence=None,
+                    needs_review=True,
+                    review_reason="empty text",
+                    total_seconds=0.0,
+                ),
+                make_category_page(3, "title_rider", confidence=0.8),
+                make_category_page(4, "title_rider", confidence=0.9),
+            ],
+            total_seconds=0.3,
+        ),
         "vlm": make_vlm_payload(
             [
                 make_vlm_page(1, fields(borrower_name="Jane Doe", loan_number="L1")),
@@ -502,14 +580,22 @@ def test_run_pipeline_end_to_end_with_fake_runner(tmp_path: Path) -> None:
         "matches": make_matches_payload([[3, 4]], unique_pages=(1,), skipped_pages=(2,)),
     }
     calls: list[str] = []
-    report = run_pipeline(pdf_path, runner=make_fake_runner(fixtures, calls))
+    commands: list[list[str]] = []
+    fake_runner = make_fake_runner(fixtures, calls)
+
+    def runner(command: list[str]) -> None:
+        commands.append(list(command))
+        fake_runner(command)
+
+    report = run_pipeline(pdf_path, runner=runner)
     assert calls == [
         "ocr_pdf.py",
         "page_classifier.py",
+        "category_verifier.py",
         "vlm_extract.py",
         "page_matcher.py",
     ]
-    assert report["schema_version"] == "2.0"
+    assert report["schema_version"] == "2.1"
     assert report["canonicalization_version"] == CANONICALIZATION_VERSION
     assert [entry["label"] for entry in report["page_labels"]] == [
         "property_tax_record_information_sheet",
@@ -517,6 +603,7 @@ def test_run_pipeline_end_to_end_with_fake_runner(tmp_path: Path) -> None:
         "title_rider",
         "title_rider",
     ]
+    assert report["page_labels"][0]["notes"] == "verifier disagreement"
     assert report["page_labels"][1]["confidence"] is None
     assert report["page_labels"][1]["notes"] == "empty text"
     assert report["documents"] == [
@@ -548,11 +635,16 @@ def test_run_pipeline_end_to_end_with_fake_runner(tmp_path: Path) -> None:
     assert report["timings"]["stages_seconds"] == {
         "ocr": 4.0,
         "classification": 2.0,
+        "verification": 0.3,
         "vlm": 4.0,
         "matching": 1.0,
     }
     assert report["timings"]["total_seconds"] > 0
     assert len(report["timings"]["pages"]) == 4
+    matcher_command = commands[-1]
+    assert Path(matcher_command[1]).name == "page_matcher.py"
+    assert "--categories-json" in matcher_command
+    assert matcher_command[-1] == str(tmp_path / "doc.category_review.json")
     json.dumps(report)
 
 

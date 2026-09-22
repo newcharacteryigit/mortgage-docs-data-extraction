@@ -248,7 +248,9 @@ deterministic and uses the same `field_normalizer.py` module:
 
 Result schema `2.0` adds top-level `schema_version` and `canonicalization_version`; each
 loan field carries `value`, `canonical_value`, `source_pages`, `variants`, and
-`needs_review`. For `AREAL_LOAN.pdf` the four property-address spellings cluster together,
+`needs_review`. Schema `2.1` additionally records the `verification` stage in
+`timings.stages_seconds` and takes page labels from the `category_verifier.py` report.
+For `AREAL_LOAN.pdf` the four property-address spellings cluster together,
 the clean `604 N Crestview Hill Dr Unit 1144, Las Vegas, NV 89139` is reported, and the
 single-page borrower mailing address on page 11 is outvoted.
 

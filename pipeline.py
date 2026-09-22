@@ -21,21 +21,24 @@ STDIO_ENCODING = "utf-8"
 JSON_SUFFIX = ".json"
 PDF_SUFFIX = ".pdf"
 CATEGORIES_SUFFIX = ".categories.json"
+REVIEW_SUFFIX = ".category_review.json"
 MATCHES_SUFFIX = ".matches.json"
 VLM_SUFFIX = ".vlm.json"
 RESULT_SUFFIX = ".result.json"
 OCR_SCRIPT = "ocr_pdf.py"
 CLASSIFIER_SCRIPT = "page_classifier.py"
+VERIFIER_SCRIPT = "category_verifier.py"
 VLM_SCRIPT = "vlm_extract.py"
 MATCHER_SCRIPT = "page_matcher.py"
 SCRIPT_DIR = Path(__file__).resolve().parent
 OTHER_LABEL = "other"
 STATUS_OK = "ok"
-RESULT_SCHEMA_VERSION = "2.0"
+RESULT_SCHEMA_VERSION = "2.1"
 VERIFICATION_STATUSES = frozenset({"ok", "mismatch", "missing"})
 LOAN_FIELDS = ("borrower_name", "property_address", "loan_number")
 STAGE_OCR = "ocr"
 STAGE_CLASSIFICATION = "classification"
+STAGE_VERIFICATION = "verification"
 STAGE_VLM = "vlm"
 STAGE_MATCHING = "matching"
 TIMING_PRECISION = 3
@@ -120,6 +123,10 @@ def default_ocr_path(pdf_path: Path) -> Path:
 
 def default_categories_path(ocr_path: Path) -> Path:
     return ocr_path.parent / f"{ocr_path.stem}{CATEGORIES_SUFFIX}"
+
+
+def default_review_path(ocr_path: Path) -> Path:
+    return ocr_path.parent / f"{ocr_path.stem}{REVIEW_SUFFIX}"
 
 
 def default_vlm_path(pdf_path: Path) -> Path:
@@ -537,6 +544,7 @@ def require_stage_total(payload: dict[str, Any], label: str) -> float:
 def build_timings(
     ocr_payload: dict[str, Any],
     categories_payload: dict[str, Any],
+    verifications_payload: dict[str, Any],
     vlm_payload: dict[str, Any],
     matches_payload: dict[str, Any],
     ocr_pages: Sequence[dict[str, Any]],
@@ -550,6 +558,9 @@ def build_timings(
             "OCR JSON total_duration_seconds",
         ),
         STAGE_CLASSIFICATION: require_stage_total(categories_payload, "Categories JSON"),
+        STAGE_VERIFICATION: require_stage_total(
+            verifications_payload, "Verification JSON"
+        ),
         STAGE_VLM: require_stage_total(vlm_payload, "VLM JSON"),
         STAGE_MATCHING: require_stage_total(matches_payload, "Matching JSON"),
     }
@@ -603,6 +614,7 @@ def build_timings(
 def build_result(
     ocr_payload: dict[str, Any],
     categories_payload: dict[str, Any],
+    verifications_payload: dict[str, Any],
     vlm_payload: dict[str, Any],
     matches_payload: dict[str, Any],
     total_seconds: float,
@@ -610,12 +622,16 @@ def build_result(
     ocr_pages = require_page_records(ocr_payload, "OCR JSON")
     ocr_numbers = [int(page["page_number"]) for page in ocr_pages]
     category_index = index_pages(require_page_records(categories_payload, "Categories JSON"))
+    verification_index = index_pages(
+        require_page_records(verifications_payload, "Verification JSON")
+    )
     vlm_index = index_pages(require_page_records(vlm_payload, "VLM JSON"))
     require_page_coverage(ocr_numbers, category_index, "Categories JSON")
+    require_page_coverage(ocr_numbers, verification_index, "Verification JSON")
     require_page_coverage(ocr_numbers, vlm_index, "VLM JSON")
-    allowed_labels = require_category_labels(categories_payload)
+    allowed_labels = require_category_labels(verifications_payload)
     page_labels = build_page_labels(
-        ocr_numbers, category_index, vlm_index, allowed_labels
+        ocr_numbers, verification_index, vlm_index, allowed_labels
     )
     documents = build_documents(matches_payload, page_labels, ocr_numbers)
     loan_level_fields = build_loan_level_fields(
@@ -624,6 +640,7 @@ def build_result(
     timings = build_timings(
         ocr_payload,
         categories_payload,
+        verifications_payload,
         vlm_payload,
         matches_payload,
         ocr_pages,
@@ -647,11 +664,19 @@ def run_pipeline(pdf_path: Path, runner: StageRunner = run_stage) -> ResultRepor
     if pdf_path.suffix.lower() != PDF_SUFFIX:
         raise ValueError(f"File does not have a {PDF_SUFFIX} suffix: {pdf_path}")
     ocr_path = default_ocr_path(pdf_path)
+    categories_path = default_categories_path(ocr_path)
+    review_path = default_review_path(ocr_path)
     stages = (
         (STAGE_OCR, stage_command(OCR_SCRIPT, pdf_path)),
         (STAGE_CLASSIFICATION, stage_command(CLASSIFIER_SCRIPT, ocr_path)),
+        (STAGE_VERIFICATION, stage_command(VERIFIER_SCRIPT, categories_path)),
         (STAGE_VLM, stage_command(VLM_SCRIPT, pdf_path, "--ocr", ocr_path)),
-        (STAGE_MATCHING, stage_command(MATCHER_SCRIPT, ocr_path)),
+        (
+            STAGE_MATCHING,
+            stage_command(
+                MATCHER_SCRIPT, ocr_path, "--categories-json", review_path
+            ),
+        ),
     )
     log_message(
         f"[pipeline] pdf={pdf_path} stages={','.join(name for name, _ in stages)}"
@@ -664,7 +689,8 @@ def run_pipeline(pdf_path: Path, runner: StageRunner = run_stage) -> ResultRepor
     total_seconds = time.perf_counter() - started
     report = build_result(
         load_json_object(ocr_path, "OCR JSON"),
-        load_json_object(default_categories_path(ocr_path), "Categories JSON"),
+        load_json_object(categories_path, "Categories JSON"),
+        load_json_object(review_path, "Verification JSON"),
         load_json_object(default_vlm_path(pdf_path), "VLM JSON"),
         load_json_object(default_matches_path(ocr_path), "Matching JSON"),
         total_seconds,
@@ -679,9 +705,10 @@ def run_pipeline(pdf_path: Path, runner: StageRunner = run_stage) -> ResultRepor
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run OCR, page classification, VLM extraction, and page matching for a "
-            "mortgage PDF and combine their reports into one result JSON with page "
-            "labels, document groups, loan-level fields, and timings."
+            "Run OCR, page classification, category verification, VLM extraction, "
+            "and page matching for a mortgage PDF and combine their reports into "
+            "one result JSON with page labels, document groups, loan-level fields, "
+            "and timings."
         )
     )
     parser.add_argument("pdf", type=Path, help="Mortgage PDF file to process")
