@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import pipeline
+from field_normalizer import CANONICALIZATION_VERSION
 from pipeline import (
     build_documents,
     build_loan_level_fields,
@@ -24,6 +25,13 @@ CATEGORY_LABELS = {
     "other": "Other / Unclassified",
 }
 EXTRACTION_FIELDS = ("borrower_name", "property_address", "loan_number", "page_number")
+PAGE_ONE_ADDRESS = "604N C restview Hill Dr, Unit 1144 Las Vegas, NV 89139"
+SPLIT_ADDRESS = "604 N Crest View Hill Dr Unit 1144, Las Vegas, NV 89139"
+CLEAN_ADDRESS = "604 N Crestview Hill Dr Unit 1144, Las Vegas, NV 89139"
+ANNOTATED_ADDRESS = (
+    "604 N Crestview Hill Dr Unit 1144, Las Vegas, NV 89139 [Property Address]"
+)
+MAILING_ADDRESS = "4124 Silvercrest Avenue, Las Vegas, NV 89129"
 
 
 def make_ocr_payload(
@@ -89,8 +97,12 @@ def make_vlm_page(
     statuses: dict[str, str] | None = None,
     mismatches: tuple[str, ...] = (),
     total_seconds: float = 0.2,
+    review_flags: dict[str, bool] | None = None,
+    similarities: dict[str, float | None] | None = None,
 ) -> dict:
     explicit = statuses or {}
+    flags = review_flags or {}
+    overrides = similarities or {}
     verification = {}
     for field in EXTRACTION_FIELDS:
         value = extracted.get(field)
@@ -98,12 +110,15 @@ def make_vlm_page(
         verification[field] = {
             "status": status,
             "found_in_ocr": status == "ok",
-            "similarity": 1.0 if status == "ok" else None,
+            "similarity": overrides.get(field, 1.0 if status == "ok" else None),
+            "match_mode": "exact" if status == "ok" else None,
+            "needs_review": flags.get(field, False),
         }
     return {
         "page_number": number,
         "page_ref": f"doc.pdf#page-{number}",
         "extracted": extracted,
+        "normalized": {},
         "verification": verification,
         "mismatches": list(mismatches),
         "ocr_reference": {"line_count": 1, "mean_score": 0.95, "duration_seconds": 1.0},
@@ -235,9 +250,50 @@ def test_build_loan_level_fields_majority_exact_match() -> None:
         make_vlm_page(3, fields(borrower_name="Alya X", loan_number="L2")),
     ]
     result = build_loan_level_fields(pages)
-    assert result["borrower_name"] == {"value": "Alya X", "source_pages": [1, 3]}
-    assert result["loan_number"] == {"value": "L1", "source_pages": [1, 2]}
-    assert result["property_address"] == {"value": None, "source_pages": []}
+    assert result["borrower_name"] == {
+        "value": "Alya X",
+        "canonical_value": "alya x",
+        "source_pages": [1, 3],
+        "variants": [{"value": "Alya X", "pages": [1, 3]}],
+        "needs_review": False,
+    }
+    assert result["loan_number"] == {
+        "value": "L1",
+        "canonical_value": "l1",
+        "source_pages": [1, 2],
+        "variants": [{"value": "L1", "pages": [1, 2]}],
+        "needs_review": True,
+    }
+    assert result["property_address"] == {
+        "value": None,
+        "canonical_value": None,
+        "source_pages": [],
+        "variants": [],
+        "needs_review": False,
+    }
+
+
+def test_build_loan_level_fields_clusters_address_variants() -> None:
+    pages = [
+        make_vlm_page(1, fields(property_address=PAGE_ONE_ADDRESS)),
+        make_vlm_page(3, fields(property_address=SPLIT_ADDRESS)),
+        make_vlm_page(4, fields(property_address=CLEAN_ADDRESS)),
+        make_vlm_page(7, fields(property_address=ANNOTATED_ADDRESS)),
+        make_vlm_page(11, fields(property_address=MAILING_ADDRESS)),
+    ]
+    result = build_loan_level_fields(pages)["property_address"]
+    assert result["value"] == CLEAN_ADDRESS
+    assert result["canonical_value"] == (
+        "604 n crestview hill dr unit 1144 las vegas nv 89139"
+    )
+    assert result["source_pages"] == [1, 3, 4, 7]
+    assert result["variants"] == [
+        {"value": PAGE_ONE_ADDRESS, "pages": [1]},
+        {"value": SPLIT_ADDRESS, "pages": [3]},
+        {"value": CLEAN_ADDRESS, "pages": [4]},
+        {"value": ANNOTATED_ADDRESS, "pages": [7]},
+    ]
+    assert result["needs_review"] is False
 
 
 def test_build_loan_level_fields_tie_uses_earliest_page() -> None:
@@ -247,8 +303,42 @@ def test_build_loan_level_fields_tie_uses_earliest_page() -> None:
     ]
     assert build_loan_level_fields(pages)["loan_number"] == {
         "value": "L2",
+        "canonical_value": "l2",
         "source_pages": [1],
+        "variants": [{"value": "L2", "pages": [1]}],
+        "needs_review": True,
     }
+
+
+def test_build_loan_level_fields_flags_close_runner_up() -> None:
+    pages = [
+        make_vlm_page(1, fields(loan_number="20414784")),
+        make_vlm_page(2, fields(loan_number="20-414-784")),
+        make_vlm_page(3, fields(loan_number="99999999")),
+    ]
+    result = build_loan_level_fields(pages)["loan_number"]
+    assert result["value"] == "20414784"
+    assert result["source_pages"] == [1, 2]
+    assert result["variants"] == [
+        {"value": "20414784", "pages": [1]},
+        {"value": "20-414-784", "pages": [2]},
+    ]
+    assert result["needs_review"] is True
+
+
+def test_build_loan_level_fields_propagates_page_review_flag() -> None:
+    pages = [
+        make_vlm_page(
+            1,
+            fields(property_address=CLEAN_ADDRESS),
+            review_flags={"property_address": True},
+        ),
+        make_vlm_page(2, fields(property_address=CLEAN_ADDRESS)),
+    ]
+    result = build_loan_level_fields(pages)["property_address"]
+    assert result["value"] == CLEAN_ADDRESS
+    assert result["source_pages"] == [1, 2]
+    assert result["needs_review"] is True
 
 
 def test_build_loan_level_fields_excludes_mismatch() -> None:
@@ -260,7 +350,10 @@ def test_build_loan_level_fields_excludes_mismatch() -> None:
     ]
     assert build_loan_level_fields(pages)["borrower_name"] == {
         "value": "Real",
+        "canonical_value": "real",
         "source_pages": [1],
+        "variants": [{"value": "Real", "pages": [1]}],
+        "needs_review": True,
     }
 
 
@@ -272,8 +365,24 @@ def test_build_loan_level_fields_returns_null_when_only_mismatch() -> None:
     ]
     assert build_loan_level_fields(pages)["borrower_name"] == {
         "value": None,
+        "canonical_value": None,
         "source_pages": [],
+        "variants": [],
+        "needs_review": False,
     }
+
+
+def test_build_loan_level_fields_requires_review_flag() -> None:
+    page = make_vlm_page(1, fields(loan_number="1"))
+    del page["verification"]["loan_number"]["needs_review"]
+    with pytest.raises(ValueError, match="needs_review"):
+        build_loan_level_fields([page])
+
+
+def test_build_loan_level_fields_rejects_invalid_similarity() -> None:
+    page = make_vlm_page(1, fields(loan_number="1"), similarities={"loan_number": 1.5})
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        build_loan_level_fields([page])
 
 
 def test_build_timings_sums_pages_and_stages() -> None:
@@ -400,6 +509,8 @@ def test_run_pipeline_end_to_end_with_fake_runner(tmp_path: Path) -> None:
         "vlm_extract.py",
         "page_matcher.py",
     ]
+    assert report["schema_version"] == "2.0"
+    assert report["canonicalization_version"] == CANONICALIZATION_VERSION
     assert [entry["label"] for entry in report["page_labels"]] == [
         "property_tax_record_information_sheet",
         "other",
@@ -415,15 +526,24 @@ def test_run_pipeline_end_to_end_with_fake_runner(tmp_path: Path) -> None:
     ]
     assert report["loan_level_fields"]["borrower_name"] == {
         "value": "Jane Doe",
+        "canonical_value": "doe jane",
         "source_pages": [1, 3],
+        "variants": [{"value": "Jane Doe", "pages": [1, 3]}],
+        "needs_review": False,
     }
     assert report["loan_level_fields"]["property_address"] == {
         "value": "1 Main St",
+        "canonical_value": "1 main st",
         "source_pages": [3, 4],
+        "variants": [{"value": "1 Main St", "pages": [3, 4]}],
+        "needs_review": False,
     }
     assert report["loan_level_fields"]["loan_number"] == {
         "value": "L1",
+        "canonical_value": "l1",
         "source_pages": [1, 3],
+        "variants": [{"value": "L1", "pages": [1, 3]}],
+        "needs_review": False,
     }
     assert report["timings"]["stages_seconds"] == {
         "ocr": 4.0,

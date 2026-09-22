@@ -4,9 +4,9 @@ import argparse
 import base64
 import difflib
 import json
+import re
 import sys
 import time
-import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -16,14 +16,24 @@ from typing import Any, NamedTuple, TypedDict
 
 import pymupdf
 
+from field_normalizer import (
+    CANONICALIZATION_VERSION,
+    FIELD_LOAN_NUMBER,
+    FIELD_SIMILARITY_THRESHOLDS,
+    canonical_key,
+    canonicalize_loan_number,
+    normalize_text,
+)
+
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
-DEFAULT_MODEL = "qwen/qwen3.5-9b"
+DEFAULT_MODEL = "google/gemma-4-e2b"
 DEFAULT_DPI = 200
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_SEED = 0
 DEFAULT_MISMATCH_THRESHOLD = 0.75
-SCHEMA_VERSION = "1.0"
+DEFAULT_REVIEW_MARGIN = 0.10
+SCHEMA_VERSION = "1.1"
 PROMPT_VERSION = "1.1"
 TEMPERATURE = 0.0
 TOP_P = 1.0
@@ -42,6 +52,9 @@ RAW_TEXT_PREVIEW_CHARS = 200
 STATUS_OK = "ok"
 STATUS_MISMATCH = "mismatch"
 STATUS_MISSING = "missing"
+MATCH_MODE_EXACT = "exact"
+MATCH_MODE_FUZZY = "fuzzy"
+DIGIT_GAP_PATTERN = re.compile(r"(?<=\d)\s+(?=\d)")
 
 EXTRACTION_FIELDS = (
     "borrower_name",
@@ -89,6 +102,8 @@ class FieldVerification(TypedDict):
     status: str
     found_in_ocr: bool
     similarity: float | None
+    match_mode: str | None
+    needs_review: bool
 
 
 class OcrReference(TypedDict):
@@ -108,6 +123,7 @@ class PageExtraction(TypedDict):
     page_number: int
     page_ref: str
     extracted: ExtractedFields
+    normalized: dict[str, str | None]
     verification: dict[str, FieldVerification]
     mismatches: list[str]
     ocr_reference: OcrReference
@@ -125,7 +141,9 @@ class ExtractionSummary(TypedDict):
     field_status_counts: dict[str, FieldStatusCounts]
     field_mismatch_count: int
     field_missing_count: int
+    review_flag_count: int
     pages_with_mismatch: list[int]
+    pages_with_review_flag: list[int]
     needs_review_page_count: int
 
 
@@ -153,7 +171,10 @@ class ExtractionParameters(TypedDict):
     max_tokens: int
     reasoning_effort: str | None
     mismatch_similarity_threshold: float
+    review_margin: float
+    field_similarity_thresholds: dict[str, float]
     text_normalization: str
+    canonicalization_version: str
 
 
 class ExtractionReport(TypedDict):
@@ -495,17 +516,7 @@ class VlmClient:
 
 
 def normalize_for_match(text: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", text)
-    without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    characters: list[str] = []
-    for character in without_marks.casefold():
-        if unicodedata.category(character) == "Pd":
-            characters.append(" ")
-        elif character.isalnum():
-            characters.append(character)
-        else:
-            characters.append(" ")
-    return " ".join("".join(characters).split())
+    return normalize_text(text)
 
 
 def best_window_similarity(value_norm: str, ocr_norm: str) -> float:
@@ -531,32 +542,84 @@ def best_window_similarity(value_norm: str, ocr_norm: str) -> float:
     return best
 
 
+def effective_threshold(field: str, mismatch_threshold: float) -> float:
+    if field not in FIELD_SIMILARITY_THRESHOLDS:
+        raise ValueError(f"Unsupported field {field!r}")
+    return max(mismatch_threshold, FIELD_SIMILARITY_THRESHOLDS[field])
+
+
+def matching_value(field: str, value: str) -> str:
+    if field == FIELD_LOAN_NUMBER:
+        return canonicalize_loan_number(value)
+    return normalize_for_match(value)
+
+
+def prepare_ocr_text(field: str, ocr_text: str) -> str:
+    normalized = normalize_for_match(ocr_text)
+    if field == FIELD_LOAN_NUMBER:
+        return DIGIT_GAP_PATTERN.sub("", normalized)
+    return normalized
+
+
 def compare_field(
-    value: str | None, ocr_norm: str, threshold: float
+    field: str,
+    value: str | None,
+    ocr_text: str,
+    mismatch_threshold: float,
+    review_margin: float = DEFAULT_REVIEW_MARGIN,
 ) -> FieldVerification:
+    threshold = effective_threshold(field, mismatch_threshold)
     if value is None:
         return {
             "status": STATUS_MISSING,
             "found_in_ocr": False,
             "similarity": None,
+            "match_mode": None,
+            "needs_review": False,
         }
-    similarity = best_window_similarity(normalize_for_match(value), ocr_norm)
+    ocr_norm = prepare_ocr_text(field, ocr_text)
+    value_norm = matching_value(field, value)
+    if value_norm and value_norm in ocr_norm:
+        similarity = 1.0
+        match_mode = MATCH_MODE_EXACT
+    else:
+        similarity = best_window_similarity(value_norm, ocr_norm)
+        match_mode = MATCH_MODE_FUZZY
     status = STATUS_OK if similarity >= threshold else STATUS_MISMATCH
+    needs_review = (
+        status == STATUS_OK
+        and match_mode == MATCH_MODE_FUZZY
+        and similarity < threshold + review_margin
+    )
     return {
         "status": status,
         "found_in_ocr": status == STATUS_OK,
         "similarity": round(similarity, SIMILARITY_PRECISION),
+        "match_mode": match_mode,
+        "needs_review": needs_review,
     }
 
 
+def build_normalized_fields(fields: ExtractedFields) -> dict[str, str | None]:
+    normalized: dict[str, str | None] = {}
+    for field in EXTRACTION_FIELDS:
+        value = fields[field]
+        normalized[field] = None if value is None else canonical_key(field, value)
+    return normalized
+
+
 def verify_extracted_fields(
-    fields: ExtractedFields, ocr_text: str, threshold: float
+    fields: ExtractedFields,
+    ocr_text: str,
+    mismatch_threshold: float,
+    review_margin: float = DEFAULT_REVIEW_MARGIN,
 ) -> tuple[dict[str, FieldVerification], list[str]]:
-    ocr_norm = normalize_for_match(ocr_text)
     verification: dict[str, FieldVerification] = {}
     mismatches: list[str] = []
     for field in EXTRACTION_FIELDS:
-        result = compare_field(fields[field], ocr_norm, threshold)
+        result = compare_field(
+            field, fields[field], ocr_text, mismatch_threshold, review_margin
+        )
         verification[field] = result
         if result["status"] == STATUS_MISMATCH:
             mismatches.append(field)
@@ -568,12 +631,23 @@ def build_summary(pages: Sequence[PageExtraction]) -> ExtractionSummary:
         field: {"ok": 0, "mismatch": 0, "missing": 0} for field in EXTRACTION_FIELDS
     }
     pages_with_mismatch: list[int] = []
+    pages_with_review_flag: list[int] = []
+    needs_review_pages: list[int] = []
+    review_flag_count = 0
     for page in pages:
+        page_has_review_flag = False
         for field in EXTRACTION_FIELDS:
-            status = page["verification"][field]["status"]
-            status_counts[field][status] += 1
+            check = page["verification"][field]
+            status_counts[field][check["status"]] += 1
+            if check["needs_review"]:
+                review_flag_count += 1
+                page_has_review_flag = True
         if page["mismatches"]:
             pages_with_mismatch.append(page["page_number"])
+        if page_has_review_flag:
+            pages_with_review_flag.append(page["page_number"])
+        if page["mismatches"] or page_has_review_flag:
+            needs_review_pages.append(page["page_number"])
     mismatch_count = sum(counts["mismatch"] for counts in status_counts.values())
     missing_count = sum(counts["missing"] for counts in status_counts.values())
     return {
@@ -581,8 +655,10 @@ def build_summary(pages: Sequence[PageExtraction]) -> ExtractionSummary:
         "field_status_counts": status_counts,
         "field_mismatch_count": mismatch_count,
         "field_missing_count": missing_count,
+        "review_flag_count": review_flag_count,
         "pages_with_mismatch": pages_with_mismatch,
-        "needs_review_page_count": len(pages_with_mismatch),
+        "pages_with_review_flag": pages_with_review_flag,
+        "needs_review_page_count": len(needs_review_pages),
     }
 
 
@@ -592,12 +668,17 @@ def run_extraction(
     client: VlmClient,
     dpi: int = DEFAULT_DPI,
     mismatch_threshold: float = DEFAULT_MISMATCH_THRESHOLD,
+    review_margin: float = DEFAULT_REVIEW_MARGIN,
 ) -> ExtractionReport:
     if dpi <= 0:
         raise ValueError(f"DPI must be positive, got: {dpi}")
     if not 0.0 <= mismatch_threshold <= 1.0:
         raise ValueError(
             f"Mismatch threshold must be within [0, 1], got: {mismatch_threshold}"
+        )
+    if not 0.0 <= review_margin <= 1.0:
+        raise ValueError(
+            f"Review margin must be within [0, 1], got: {review_margin}"
         )
     ocr_document = load_ocr_document(ocr_path)
     if Path(ocr_document.source).name != pdf_path.name:
@@ -644,18 +725,24 @@ def run_extraction(
             vlm_duration = time.perf_counter() - vlm_started
             compare_started = time.perf_counter()
             verification, mismatches = verify_extracted_fields(
-                fields, record.text, mismatch_threshold
+                fields, record.text, mismatch_threshold, review_margin
             )
             compare_duration = time.perf_counter() - compare_started
             page_duration = time.perf_counter() - page_started
             render_seconds += render_duration
             vlm_seconds += vlm_duration
             compare_seconds += compare_duration
+            review_fields = [
+                field
+                for field in EXTRACTION_FIELDS
+                if verification[field]["needs_review"]
+            ]
             pages.append(
                 {
                     "page_number": record.page_number,
                     "page_ref": make_page_ref(record.source, record.page_number),
                     "extracted": fields,
+                    "normalized": build_normalized_fields(fields),
                     "verification": verification,
                     "mismatches": mismatches,
                     "ocr_reference": {
@@ -675,7 +762,8 @@ def run_extraction(
                 f"[vlm] page {record.page_number} done "
                 f"render={render_duration:.2f}s vlm={vlm_duration:.2f}s "
                 f"compare={compare_duration:.3f}s "
-                f"mismatches={','.join(mismatches) if mismatches else '-'}"
+                f"mismatches={','.join(mismatches) if mismatches else '-'} "
+                f"review={','.join(review_fields) if review_fields else '-'}"
             )
     finally:
         document.close()
@@ -698,7 +786,10 @@ def run_extraction(
             "max_tokens": client.max_tokens,
             "reasoning_effort": None if client.thinking else REASONING_EFFORT_DISABLED,
             "mismatch_similarity_threshold": mismatch_threshold,
+            "review_margin": review_margin,
+            "field_similarity_thresholds": dict(FIELD_SIMILARITY_THRESHOLDS),
             "text_normalization": TEXT_NORMALIZATION,
+            "canonicalization_version": CANONICALIZATION_VERSION,
         },
         "summary": summary,
         "pages": pages,
@@ -786,8 +877,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MISMATCH_THRESHOLD,
         help=(
-            "Similarity below this value is reported as a mismatch "
+            "Global similarity floor; per-field minimums can be higher "
             f"(default: {DEFAULT_MISMATCH_THRESHOLD})"
+        ),
+    )
+    parser.add_argument(
+        "--review-margin",
+        type=float,
+        default=DEFAULT_REVIEW_MARGIN,
+        help=(
+            "Fuzzy matches within this margin above the effective threshold are "
+            f"flagged for review (default: {DEFAULT_REVIEW_MARGIN})"
         ),
     )
     parser.add_argument(
@@ -817,6 +917,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"--mismatch-threshold must be within [0, 1], got: "
                 f"{args.mismatch_threshold}"
             )
+        if not 0.0 <= args.review_margin <= 1.0:
+            raise ValueError(
+                f"--review-margin must be within [0, 1], got: {args.review_margin}"
+            )
         ocr_path = args.ocr if args.ocr is not None else default_ocr_path(args.pdf)
         client = VlmClient(
             base_url=args.base_url,
@@ -833,6 +937,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             client,
             dpi=args.dpi,
             mismatch_threshold=args.mismatch_threshold,
+            review_margin=args.review_margin,
         )
     except Exception as exc:
         log_message(f"ERROR: {type(exc).__name__}: {exc}")
@@ -851,7 +956,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     log_message(
         f"[vlm] mismatched fields={summary['field_mismatch_count']} "
         f"missing fields={summary['field_missing_count']} "
-        f"pages_with_mismatch={summary['pages_with_mismatch']}"
+        f"review flags={summary['review_flag_count']} "
+        f"pages_with_mismatch={summary['pages_with_mismatch']} "
+        f"pages_with_review_flag={summary['pages_with_review_flag']}"
     )
     log_message(f"[vlm] JSON written to: {out_path}")
     return 0

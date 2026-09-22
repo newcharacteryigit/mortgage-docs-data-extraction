@@ -8,7 +8,14 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
+
+from field_normalizer import (
+    CANONICALIZATION_VERSION,
+    canonical_key,
+    representative_value,
+    values_match,
+)
 
 STDIO_ENCODING = "utf-8"
 JSON_SUFFIX = ".json"
@@ -24,6 +31,7 @@ MATCHER_SCRIPT = "page_matcher.py"
 SCRIPT_DIR = Path(__file__).resolve().parent
 OTHER_LABEL = "other"
 STATUS_OK = "ok"
+RESULT_SCHEMA_VERSION = "2.0"
 VERIFICATION_STATUSES = frozenset({"ok", "mismatch", "missing"})
 LOAN_FIELDS = ("borrower_name", "property_address", "loan_number")
 STAGE_OCR = "ocr"
@@ -33,6 +41,8 @@ STAGE_MATCHING = "matching"
 TIMING_PRECISION = 3
 CONFIDENCE_PRECISION = 4
 VLM_MISMATCH_NOTE_PREFIX = "vlm mismatch: "
+REVIEW_FLAG_PAGE_MIN = 2
+REVIEW_FLAG_CLUSTER_MARGIN = 1
 
 
 class PageLabel(TypedDict):
@@ -47,9 +57,17 @@ class DocumentEntry(TypedDict):
     pages: list[int]
 
 
+class LoanFieldVariant(TypedDict):
+    value: str
+    pages: list[int]
+
+
 class LoanFieldValue(TypedDict):
     value: str | None
+    canonical_value: str | None
     source_pages: list[int]
+    variants: list[LoanFieldVariant]
+    needs_review: bool
 
 
 class PageTiming(TypedDict):
@@ -67,10 +85,19 @@ class PipelineTimings(TypedDict):
 
 
 class ResultReport(TypedDict):
+    schema_version: str
+    canonicalization_version: str
     page_labels: list[PageLabel]
     documents: list[DocumentEntry]
     loan_level_fields: dict[str, LoanFieldValue]
     timings: PipelineTimings
+
+
+class FieldEntry(NamedTuple):
+    page_number: int
+    value: str
+    similarity: float | None
+    needs_review: bool
 
 
 StageRunner = Callable[[Sequence[str]], None]
@@ -333,10 +360,36 @@ def build_documents(
     return documents
 
 
-def build_loan_level_fields(
+def optional_similarity(value: Any, page_number: int, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"VLM JSON page {page_number} verification {field} has a non-numeric "
+            f"similarity: {value!r}"
+        )
+    similarity = float(value)
+    if not 0.0 <= similarity <= 1.0:
+        raise ValueError(
+            f"VLM JSON page {page_number} verification {field} has a similarity "
+            f"outside [0, 1]: {similarity}"
+        )
+    return similarity
+
+
+def require_review_flag(value: Any, page_number: int, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"VLM JSON page {page_number} verification {field} has a non-boolean "
+            "'needs_review'; re-run vlm_extract.py to regenerate the report"
+        )
+    return value
+
+
+def collect_field_entries(
     vlm_pages: Sequence[dict[str, Any]],
-) -> dict[str, LoanFieldValue]:
-    occurrences: dict[str, dict[str, list[int]]] = {field: {} for field in LOAN_FIELDS}
+) -> dict[str, list[FieldEntry]]:
+    entries: dict[str, list[FieldEntry]] = {field: [] for field in LOAN_FIELDS}
     for page in vlm_pages:
         page_number = int(page["page_number"])
         extracted = require_object(
@@ -365,17 +418,114 @@ def build_loan_level_fields(
                 )
             if status != STATUS_OK:
                 continue
-            occurrences[field].setdefault(value, []).append(page_number)
+            entries[field].append(
+                FieldEntry(
+                    page_number=page_number,
+                    value=value,
+                    similarity=optional_similarity(
+                        check.get("similarity"), page_number, field
+                    ),
+                    needs_review=require_review_flag(
+                        check.get("needs_review"), page_number, field
+                    ),
+                )
+            )
+    return entries
+
+
+def cluster_entries(
+    field: str, entries: Sequence[FieldEntry]
+) -> list[list[FieldEntry]]:
+    clusters: list[list[FieldEntry]] = []
+    for entry in entries:
+        for cluster in clusters:
+            if any(
+                values_match(field, entry.value, member.value) for member in cluster
+            ):
+                cluster.append(entry)
+                break
+        else:
+            clusters.append([entry])
+    return clusters
+
+
+def cluster_pages(cluster: Sequence[FieldEntry]) -> list[int]:
+    return sorted({entry.page_number for entry in cluster})
+
+
+def cluster_similarity(cluster: Sequence[FieldEntry]) -> float:
+    similarities = [
+        entry.similarity for entry in cluster if entry.similarity is not None
+    ]
+    if not similarities:
+        return 0.0
+    return sum(similarities) / len(similarities)
+
+
+def build_variants(cluster: Sequence[FieldEntry]) -> list[LoanFieldVariant]:
+    pages_by_value: dict[str, list[int]] = {}
+    for entry in cluster:
+        pages_by_value.setdefault(entry.value, []).append(entry.page_number)
+    return [
+        {"value": value, "pages": sorted(pages)}
+        for value, pages in sorted(
+            pages_by_value.items(), key=lambda item: (min(item[1]), item[0])
+        )
+    ]
+
+
+def rank_clusters(
+    clusters: Sequence[Sequence[FieldEntry]],
+) -> list[Sequence[FieldEntry]]:
+    return sorted(
+        clusters,
+        key=lambda cluster: (
+            -len(cluster_pages(cluster)),
+            -cluster_similarity(cluster),
+            min(entry.page_number for entry in cluster),
+        ),
+    )
+
+
+def build_loan_level_fields(
+    vlm_pages: Sequence[dict[str, Any]],
+) -> dict[str, LoanFieldValue]:
+    entries = collect_field_entries(vlm_pages)
     fields: dict[str, LoanFieldValue] = {}
     for field in LOAN_FIELDS:
-        by_value = occurrences[field]
-        if not by_value:
-            fields[field] = {"value": None, "source_pages": []}
+        clusters = cluster_entries(field, entries[field])
+        if not clusters:
+            fields[field] = {
+                "value": None,
+                "canonical_value": None,
+                "source_pages": [],
+                "variants": [],
+                "needs_review": False,
+            }
             continue
-        winner = min(
-            by_value, key=lambda value: (-len(by_value[value]), by_value[value][0])
+        ordered = rank_clusters(clusters)
+        winner = ordered[0]
+        winner_pages = cluster_pages(winner)
+        runner_up_pages = len(cluster_pages(ordered[1])) if len(ordered) > 1 else 0
+        variants = build_variants(winner)
+        representative = representative_value(
+            field, [(variant["value"], variant["pages"]) for variant in variants]
         )
-        fields[field] = {"value": winner, "source_pages": by_value[winner]}
+        needs_review = (
+            any(entry.needs_review for entry in winner)
+            or len(winner_pages) < REVIEW_FLAG_PAGE_MIN
+            or (
+                runner_up_pages > 0
+                and len(winner_pages) - runner_up_pages <= REVIEW_FLAG_CLUSTER_MARGIN
+            )
+        )
+        fields[field] = {
+            "value": representative,
+            "canonical_value": canonical_key(field, representative),
+            "source_pages": winner_pages,
+            "variants": variants,
+            "needs_review": needs_review,
+        }
     return fields
 
 
@@ -482,6 +632,8 @@ def build_result(
         total_seconds,
     )
     return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "canonicalization_version": CANONICALIZATION_VERSION,
         "page_labels": page_labels,
         "documents": documents,
         "loan_level_fields": loan_level_fields,
