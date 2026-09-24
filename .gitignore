@@ -1,6 +1,7 @@
 # OCR input PDF and generated JSON outputs
 AREAL_LOAN.pdf
 *.json
+!AREAL_LOAN.result.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

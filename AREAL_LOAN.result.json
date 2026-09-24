@@ -1,0 +1,308 @@
+{
+  "schema_version": "2.1",
+  "canonicalization_version": "1.0",
+  "page_labels": [
+    {
+      "page_number": 1,
+      "label": "property_tax_record_information_sheet",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 2,
+      "label": "property_tax_record_information_sheet",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 3,
+      "label": "title_signature_name_affidavit_ack",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 4,
+      "label": "title_rider",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 5,
+      "label": "title_rider",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 6,
+      "label": "title_rider",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 7,
+      "label": "lender_rate_note",
+      "confidence": 1.0,
+      "notes": ""
+    },
+    {
+      "page_number": 8,
+      "label": "lender_rate_note",
+      "confidence": 0.99,
+      "notes": ""
+    },
+    {
+      "page_number": 9,
+      "label": "lender_rate_note",
+      "confidence": 0.98,
+      "notes": ""
+    },
+    {
+      "page_number": 10,
+      "label": "lender_rate_note",
+      "confidence": 0.99,
+      "notes": ""
+    },
+    {
+      "page_number": 11,
+      "label": "mortgage_closing_disclosure_seller",
+      "confidence": 0.97,
+      "notes": "vlm mismatch: property_address"
+    },
+    {
+      "page_number": 12,
+      "label": "mortgage_closing_disclosure_seller",
+      "confidence": 0.82,
+      "notes": ""
+    }
+  ],
+  "documents": [
+    {
+      "label": "property_tax_record_information_sheet",
+      "pages": [
+        1,
+        2
+      ]
+    },
+    {
+      "label": "title_signature_name_affidavit_ack",
+      "pages": [
+        3
+      ]
+    },
+    {
+      "label": "title_rider",
+      "pages": [
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "label": "lender_rate_note",
+      "pages": [
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "label": "mortgage_closing_disclosure_seller",
+      "pages": [
+        11,
+        12
+      ]
+    }
+  ],
+  "loan_level_fields": {
+    "borrower_name": {
+      "value": "Alya Renard-Van Mercer",
+      "canonical_value": "alya mercer renard van",
+      "source_pages": [
+        1,
+        3,
+        6,
+        10,
+        11
+      ],
+      "variants": [
+        {
+          "value": "Alya Renard—Van Mercer",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "value": "Alya Renard-Van Mercer",
+          "pages": [
+            3,
+            6,
+            10,
+            11
+          ]
+        }
+      ],
+      "needs_review": false
+    },
+    "property_address": {
+      "value": "604 N Crestview Hill Dr Unit 1144, Las Vegas, NV 89139",
+      "canonical_value": "604 n crestview hill dr unit 1144 las vegas nv 89139",
+      "source_pages": [
+        1,
+        3,
+        4,
+        7
+      ],
+      "variants": [
+        {
+          "value": "604N C restview Hill Dr, Unit 1144 Las Vegas, NV 89139",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "value": "604 N Crest View Hill Dr Unit 1144, Las Vegas, NV 89139",
+          "pages": [
+            3
+          ]
+        },
+        {
+          "value": "604 N Crestview Hill Dr Unit 1144, Las Vegas, NV 89139",
+          "pages": [
+            4,
+            7
+          ]
+        }
+      ],
+      "needs_review": false
+    },
+    "loan_number": {
+      "value": "20414784",
+      "canonical_value": "20414784",
+      "source_pages": [
+        1,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "variants": [
+        {
+          "value": "20414784",
+          "pages": [
+            1,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ]
+        }
+      ],
+      "needs_review": false
+    }
+  },
+  "timings": {
+    "total_seconds": 141.273,
+    "stages_seconds": {
+      "ocr": 48.799,
+      "classification": 5.495,
+      "verification": 0.0,
+      "vlm": 35.227,
+      "matching": 22.866
+    },
+    "pages": [
+      {
+        "page_number": 1,
+        "ocr_seconds": 5.208,
+        "classification_seconds": 0.483,
+        "vlm_seconds": 2.702,
+        "total_seconds": 8.393
+      },
+      {
+        "page_number": 2,
+        "ocr_seconds": 2.517,
+        "classification_seconds": 0.431,
+        "vlm_seconds": 6.523,
+        "total_seconds": 9.471
+      },
+      {
+        "page_number": 3,
+        "ocr_seconds": 2.428,
+        "classification_seconds": 0.466,
+        "vlm_seconds": 2.362,
+        "total_seconds": 5.256
+      },
+      {
+        "page_number": 4,
+        "ocr_seconds": 3.614,
+        "classification_seconds": 0.431,
+        "vlm_seconds": 2.251,
+        "total_seconds": 6.296
+      },
+      {
+        "page_number": 5,
+        "ocr_seconds": 4.817,
+        "classification_seconds": 0.497,
+        "vlm_seconds": 1.967,
+        "total_seconds": 7.281
+      },
+      {
+        "page_number": 6,
+        "ocr_seconds": 2.786,
+        "classification_seconds": 0.42,
+        "vlm_seconds": 2.052,
+        "total_seconds": 5.258
+      },
+      {
+        "page_number": 7,
+        "ocr_seconds": 5.427,
+        "classification_seconds": 0.455,
+        "vlm_seconds": 2.389,
+        "total_seconds": 8.271
+      },
+      {
+        "page_number": 8,
+        "ocr_seconds": 7.1,
+        "classification_seconds": 0.483,
+        "vlm_seconds": 2.262,
+        "total_seconds": 9.845
+      },
+      {
+        "page_number": 9,
+        "ocr_seconds": 1.75,
+        "classification_seconds": 0.445,
+        "vlm_seconds": 1.925,
+        "total_seconds": 4.12
+      },
+      {
+        "page_number": 10,
+        "ocr_seconds": 3.968,
+        "classification_seconds": 0.474,
+        "vlm_seconds": 2.037,
+        "total_seconds": 6.479
+      },
+      {
+        "page_number": 11,
+        "ocr_seconds": 4.439,
+        "classification_seconds": 0.47,
+        "vlm_seconds": 2.191,
+        "total_seconds": 7.1
+      },
+      {
+        "page_number": 12,
+        "ocr_seconds": 2.793,
+        "classification_seconds": 0.439,
+        "vlm_seconds": 6.563,
+        "total_seconds": 9.795
+      }
+    ]
+  }
+}
